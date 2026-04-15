@@ -2,13 +2,25 @@ import { Logger } from "./logger";
 import { validateArgsWithZod } from "./utils";
 import {
 	Ai,
+	AiModels,
 	AiTextGenerationOutput,
+	ChatCompletionsCommonOptions,
 	RoleScopedChatInput,
 } from "@cloudflare/workers-types";
 import {
 	AiTextGenerationToolInputWithFunction,
 	BaseAiTextGenerationModels,
 } from "./types";
+
+/**
+ * Extracts advanced chat input configuration (excluding messages and tools)
+ * from the model's input type, supporting both legacy AiTextGenerationInput
+ * and newer ChatCompletionsMessagesInput formats.
+ */
+type ChatInputConfig<Model extends keyof AiModels> = Omit<
+	AiModels[Model]["inputs"],
+	"messages" | "tools"
+>;
 
 type NormalizedToolCall = {
 	name: string;
@@ -80,14 +92,15 @@ function extractToolCalls(response: unknown): NormalizedToolCall[] {
  * @param {boolean} [config.strictValidation=false] - Whether to perform strict validation (using zod) of the arguments passed to the tools.
  * @param {boolean} [config.verbose=false] - Whether to enable verbose logging.
  * @param {(tools: AiTextGenerationToolInputWithFunction[], ai: Ai, model: BaseAiTextGenerationModels, messages: RoleScopedChatInput[]) => Promise<AiTextGenerationToolInputWithFunction[]>} [config.trimFunction] - Use a trim function to trim down the number of tools given to the AI for a given task. You can also use this alongside `autoTrimTools`, which uses an extra AI.run call to cut down on the input tokens of the tool call based on the tool's names.
+ * @param {ChatCompletionsCommonOptions} [chatInputConfig] - Advanced AI.run configuration options (e.g. temperature, max_tokens, top_p, seed, response_format). Inferred from the model's input type.
  *
- * @returns {Promise<AiTextGenerationOutput>} The final response in the same format as the AI.run call.
+ * @returns {Promise<AiModels[Model]["postProcessedOutputs"]>} The final response in the same format as the AI.run call, with the output type inferred from the provided model.
  */
-export const runWithTools = async (
+export const runWithTools = async <Model extends BaseAiTextGenerationModels>(
 	/** The AI instance to use for the run. */
 	ai: Ai,
 	/** The function calling model to use for the run. We recommend using `@hf/nousresearch/hermes-2-pro-mistral-7b`, `llama-3` or equivalent model that's suited for function calling. */
-	model: BaseAiTextGenerationModels,
+	model: Model,
 	/** The input for the runWithTools call. */
 	input: {
 		/** The messages to be sent to the AI. */
@@ -114,7 +127,9 @@ export const runWithTools = async (
 			messages: RoleScopedChatInput[],
 		) => Promise<AiTextGenerationToolInputWithFunction[]>;
 	} = {},
-): Promise<AiTextGenerationOutput> => {
+	/** Advanced AI.run configuration options (e.g. temperature, max_tokens, top_p, seed, response_format). Inferred from the model's input type. */
+	chatInputConfig: ChatInputConfig<Model> = {} as ChatInputConfig<Model>,
+): Promise<AiModels[Model]["postProcessedOutputs"]> => {
 	// Destructure config with default values
 	const {
 		streamFinalResponse = false,
@@ -169,11 +184,11 @@ export const runWithTools = async (
 		maxRecursiveToolRuns,
 	}: {
 		ai: Ai;
-		model: BaseAiTextGenerationModels;
+		model: Model;
 		messages: RoleScopedChatInput[];
 		streamFinalResponse: boolean;
 		maxRecursiveToolRuns: number;
-	}): Promise<AiTextGenerationOutput> {
+	}): Promise<AiModels[Model]["postProcessedOutputs"]> {
 		try {
 			Logger.info("Starting AI.run call");
 			Logger.info("Messages", JSON.stringify(messages, null, 2));
@@ -181,9 +196,10 @@ export const runWithTools = async (
 			Logger.info(`Only using ${input.tools.length} tools`);
 
 			const rawResponse = await ai.run(model, {
-				messages: messages,
+				messages,
+				tools,
 				stream: false,
-				tools: tools,
+				...(chatInputConfig as ChatCompletionsCommonOptions),
 			});
 
 			const chars =
@@ -285,8 +301,9 @@ export const runWithTools = async (
 				);
 
 				const finalResponse = await ai.run(model, {
-					messages: messages,
+					messages,
 					stream: streamFinalResponse,
+					...(chatInputConfig as ChatCompletionsCommonOptions),
 				});
 				totalCharacters += JSON.stringify(messages).length;
 				Logger.info(
@@ -294,7 +311,6 @@ export const runWithTools = async (
 				);
 
 				Logger.info(`Total number of characters: ${totalCharacters}`);
-				//@ts-expect-error
 				return finalResponse;
 			}
 		} catch (error) {
