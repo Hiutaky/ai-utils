@@ -2,12 +2,69 @@ import { Logger } from "./logger";
 import { validateArgsWithZod } from "./utils";
 import {
 	Ai,
-	AiTextGenerationInput,
 	AiTextGenerationOutput,
-	BaseAiTextGenerationModels,
 	RoleScopedChatInput,
 } from "@cloudflare/workers-types";
-import { AiTextGenerationToolInputWithFunction } from "./types";
+import {
+	AiTextGenerationToolInputWithFunction,
+	BaseAiTextGenerationModels,
+} from "./types";
+
+type NormalizedToolCall = {
+	name: string;
+	arguments: unknown;
+};
+/**
+ * Extracts tool calls from either Mistral-like or OpenAI-like response formats.
+ */
+function extractToolCalls(response: unknown): NormalizedToolCall[] {
+	if (!response || typeof response !== "object") {
+		return [];
+	}
+
+	const res = response as Record<string, unknown>;
+
+	// Mistral-like format: { tool_calls: [{ name, arguments }] }
+	if (Array.isArray(res.tool_calls)) {
+		return res.tool_calls
+			.filter(Boolean)
+			.map((tc: { name: string; arguments: unknown }) => ({
+				name: tc.name,
+				arguments: tc.arguments,
+			}));
+	}
+
+	// OpenAI-like format: { choices: [{ message: { tool_calls: [{ function: { name, arguments } }] } }] }
+	if (Array.isArray(res.choices)) {
+		const choices = res.choices as Array<{
+			message?: {
+				tool_calls?: Array<{
+					function?: { name: string; arguments: string };
+				}>;
+			};
+		}>;
+		for (const choice of choices) {
+			if (Array.isArray(choice.message?.tool_calls)) {
+				return choice.message.tool_calls.filter(Boolean).map((tc) => {
+					let args: unknown = tc.function?.arguments;
+					if (typeof args === "string") {
+						try {
+							args = JSON.parse(args);
+						} catch {
+							// Keep as string if not valid JSON
+						}
+					}
+					return {
+						name: tc.function?.name ?? "",
+						arguments: args,
+					};
+				});
+			}
+		}
+	}
+
+	return [];
+}
 
 /**
  * Runs a set of tools on a given input and returns the final response in the same format as the AI.run call.
@@ -123,17 +180,11 @@ export const runWithTools = async (
 
 			Logger.info(`Only using ${input.tools.length} tools`);
 
-			const response = (await ai.run(model, {
+			const rawResponse = await ai.run(model, {
 				messages: messages,
 				stream: false,
 				tools: tools,
-			})) as {
-				response?: string;
-				tool_calls?: {
-					name: string;
-					arguments: unknown;
-				}[];
-			};
+			});
 
 			const chars =
 				JSON.stringify(messages).length +
@@ -143,9 +194,10 @@ export const runWithTools = async (
 				`Number of characters for the first AI.run call: ${totalCharacters}`,
 			);
 
-			Logger.info("AI.run call completed", response);
+			Logger.info("AI.run call completed", rawResponse);
 
-			tool_calls = response.tool_calls?.filter(Boolean) ?? [];
+			// Extract tool_calls from either Mistral-like or OpenAI-like response format
+			tool_calls = extractToolCalls(rawResponse);
 
 			const toolCallPromises = tool_calls.map(async (toolCall) => {
 				const toolCallObjectJson = toolCall;
@@ -197,7 +249,6 @@ export const runWithTools = async (
 						messages.push({
 							role: "tool",
 							content: JSON.stringify(result),
-							// @ts-expect-error workerd types
 							name: selectedTool.name,
 						});
 					} catch (error) {
@@ -205,7 +256,6 @@ export const runWithTools = async (
 						messages.push({
 							role: "tool",
 							content: `Error executing tool ${selectedTool.name}: ${(error as Error).message}`,
-							// @ts-expect-error workerd types
 							name: selectedTool.name,
 						});
 					}
@@ -213,7 +263,7 @@ export const runWithTools = async (
 					Logger.error(
 						`Function for tool ${toolCallObjectJson.name} is undefined`,
 					);
-          return response
+					return rawResponse as AiTextGenerationOutput;
 				}
 			});
 
@@ -244,6 +294,7 @@ export const runWithTools = async (
 				);
 
 				Logger.info(`Total number of characters: ${totalCharacters}`);
+				//@ts-expect-error
 				return finalResponse;
 			}
 		} catch (error) {
