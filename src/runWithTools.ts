@@ -197,9 +197,9 @@ export const runWithTools = async <Model extends BaseAiTextGenerationModels>(
 
 			const rawResponse = await ai.run(model, {
 				messages,
-				tools,
 				stream: false,
 				...(chatInputConfig as ChatCompletionsCommonOptions),
+				tools,
 			});
 
 			const chars =
